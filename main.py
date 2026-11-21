@@ -28,6 +28,48 @@ engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+RATE_CODES = (
+    "foot_podryad_lt2|foot_podryad_gt2|foot_podryad_gt6|foot_podryad_gt12|"
+    "foot_contract_lt2|foot_contract_gt2|foot_contract_gt6|foot_contract_gt12|"
+    "company_car_podryad_lt2|company_car_podryad_gt2|company_car_podryad_gt6|company_car_podryad_gt12|"
+    "company_car_contract_lt2|company_car_contract_gt2|company_car_contract_gt6|company_car_contract_gt12|"
+    "own_car_podryad_lt2|own_car_podryad_gt2|own_car_podryad_gt6|own_car_podryad_gt12|"
+    "own_car_contract_lt2|own_car_contract_gt2|own_car_contract_gt6|own_car_contract_gt12"
+)
+
+RATE_FORMULAS = {
+    # Пеший — подряд (-14%, +2.5 за доставку)
+    "foot_podryad_lt2": ("foot_hourly", 4.7, 2.5, 0.14),
+    "foot_podryad_gt2": ("foot_hourly", 5.25, 2.5, 0.14),
+    "foot_podryad_gt6": ("foot_hourly", 5.50, 2.5, 0.14),
+    "foot_podryad_gt12": ("foot_hourly", 5.75, 2.5, 0.14),
+    # Пеший — контракт (-15%, +2.5 за доставку)
+    "foot_contract_lt2": ("foot_hourly", 4.7, 2.5, 0.15),
+    "foot_contract_gt2": ("foot_hourly", 5.25, 2.5, 0.15),
+    "foot_contract_gt6": ("foot_hourly", 5.50, 2.5, 0.15),
+    "foot_contract_gt12": ("foot_hourly", 5.75, 2.5, 0.15),
+    # Авто компании — подряд (-14%, +1 за доставку)
+    "company_car_podryad_lt2": ("foot_hourly", 4.7, 1.0, 0.14),
+    "company_car_podryad_gt2": ("foot_hourly", 5.25, 1.0, 0.14),
+    "company_car_podryad_gt6": ("foot_hourly", 5.50, 1.0, 0.14),
+    "company_car_podryad_gt12": ("foot_hourly", 5.75, 1.0, 0.14),
+    # Авто компании — контракт (-15%, +1 за доставку)
+    "company_car_contract_lt2": ("foot_hourly", 4.7, 1.0, 0.15),
+    "company_car_contract_gt2": ("foot_hourly", 5.25, 1.0, 0.15),
+    "company_car_contract_gt6": ("foot_hourly", 5.50, 1.0, 0.15),
+    "company_car_contract_gt12": ("foot_hourly", 5.75, 1.0, 0.15),
+    # Своё авто — подряд (((ч * ставка) - 14%) + 6.77 * дост)
+    "own_car_podryad_lt2": ("own_car", 2.0, 6.77, 0.14),
+    "own_car_podryad_gt2": ("own_car", 2.75, 6.77, 0.14),
+    "own_car_podryad_gt6": ("own_car", 3.0, 6.77, 0.14),
+    "own_car_podryad_gt12": ("own_car", 3.25, 6.77, 0.14),
+    # Своё авто — контракт (((ч * ставка) - 15%) + 7.19 * дост)
+    "own_car_contract_lt2": ("own_car", 2.0, 7.19, 0.15),
+    "own_car_contract_gt2": ("own_car", 2.75, 7.19, 0.15),
+    "own_car_contract_gt6": ("own_car", 3.0, 7.19, 0.15),
+    "own_car_contract_gt12": ("own_car", 3.25, 7.19, 0.15),
+}
+
 
 class User(Base):
     __tablename__ = "users"
@@ -35,7 +77,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(64), unique=True, nullable=False, index=True)
     password_hash = Column(Text, nullable=False)
-    courier_type = Column(String(20), nullable=False)  # foot | company_car | own_car
+    courier_type = Column(String(32), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
 
 
@@ -57,9 +99,10 @@ app = FastAPI(title="Courier Schedule API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://wordlist-25840.web.app",
-                   "http://127.0.0.1:5500", 
-                   ],
+    allow_origins=[
+        "https://wordlist-25840.web.app",
+        "http://127.0.0.1:5500",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -69,12 +112,17 @@ app.add_middleware(
 class RegisterRequest(BaseModel):
     username: str = Field(..., min_length=2, max_length=64)
     password: str = Field(..., min_length=4, max_length=128)
-    courier_type: str = Field(..., pattern="^(foot|company_car|own_car)$")
+    courier_type: str = Field(..., pattern=f"^({RATE_CODES})$")
 
 
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class RateUpdateRequest(BaseModel):
+    user_id: int
+    courier_type: str = Field(..., pattern=f"^({RATE_CODES})$")
 
 
 class ShiftUpsertRequest(BaseModel):
@@ -100,20 +148,19 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 
 def calculate_pay(hours: float, deliveries: int, courier_type: str) -> dict:
-    if courier_type == "foot":
-        gross = (4.7 * hours) + (2.5 * deliveries)
-        tax = gross * 0.14
+    spec = RATE_FORMULAS.get(courier_type)
+    if not spec:
+        raise HTTPException(status_code=400, detail="Неизвестный тип ставки курьера")
+
+    mode_type, hour_rate, delivery_rate, tax_rate = spec
+    if mode_type == "foot_hourly":
+        gross = (hour_rate * hours) + (delivery_rate * deliveries)
+        tax = gross * tax_rate
         net = gross - tax
-    elif courier_type == "company_car":
-        gross = (4.7 * hours) + (1.0 * deliveries)
-        tax = gross * 0.14
-        net = gross - tax
-    elif courier_type == "own_car":
-        hourly_gross = 2.0 * hours
-        tax = hourly_gross * 0.14
-        net = (hourly_gross - tax) + (7.19 * deliveries)
-    else:
-        raise HTTPException(status_code=400, detail="Неизвестный тип курьера")
+    else:  # own_car
+        hourly_gross = hour_rate * hours
+        tax = hourly_gross * tax_rate
+        net = (hourly_gross - tax) + (delivery_rate * deliveries)
 
     return {
         "tax": round(tax, 2),
@@ -126,7 +173,6 @@ def register_user(payload: RegisterRequest):
     username_clean = payload.username.strip().lower()
     if not username_clean:
         raise HTTPException(status_code=400, detail="Логин не может быть пустым")
-
     with SessionLocal() as db:
         existing = db.query(User).filter(User.username == username_clean).first()
         if existing:
@@ -155,6 +201,24 @@ def login_user(payload: LoginRequest):
         user = db.query(User).filter(User.username == username_clean).first()
         if not user or not verify_password(payload.password, user.password_hash):
             raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+
+        return {
+            "user_id": user.id,
+            "username": user.username,
+            "courier_type": user.courier_type,
+        }
+
+
+@app.patch("/api/auth/rate")
+def update_user_rate(payload: RateUpdateRequest):
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.id == payload.user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+        user.courier_type = payload.courier_type
+        db.commit()
+        db.refresh(user)
 
         return {
             "user_id": user.id,
@@ -241,7 +305,6 @@ def upsert_shift(payload: ShiftUpsertRequest):
             ).delete()
             db.commit()
             return {"status": "deleted", "date": payload.work_date.isoformat()}
-
         shift = (
             db.query(Shift)
             .filter(
